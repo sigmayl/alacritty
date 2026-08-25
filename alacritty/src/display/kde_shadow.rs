@@ -31,20 +31,21 @@ struct ShadowGeometry {
     right: u32,
     bottom: u32,
     corner_radius: u32,
-    scale_factor: f32,
 }
 
 impl ShadowGeometry {
-    fn new(scale_factor: f64) -> Self {
-        let scaled = |value: f64| (value * scale_factor).round().max(1.) as u32;
+    fn new() -> Self {
+        // KWin interprets shadow buffer pixels and offsets directly in surface coordinates;
+        // shadow buffers have no buffer scale. Keep them in logical pixels so their corner
+        // follows the window's logical corner radius at fractional DPI.
+        let logical = |value: f64| value.round().max(1.) as u32;
         let side = SHADOW_EXTENT - SHADOW_OVERLAP;
         Self {
-            left: scaled(side),
-            top: scaled(side - SHADOW_VERTICAL_OFFSET),
-            right: scaled(side),
-            bottom: scaled(side + SHADOW_VERTICAL_OFFSET),
-            corner_radius: scaled(CORNER_RADIUS),
-            scale_factor: scale_factor as f32,
+            left: logical(side),
+            top: logical(side - SHADOW_VERTICAL_OFFSET),
+            right: logical(side),
+            bottom: logical(side + SHADOW_VERTICAL_OFFSET),
+            corner_radius: logical(CORNER_RADIUS),
         }
     }
 }
@@ -74,12 +75,10 @@ pub struct KdeShadow {
     connection: Connection,
     event_queue: EventQueue<State>,
     manager: org_kde_kwin_shadow_manager::OrgKdeKwinShadowManager,
-    shm: wl_shm::WlShm,
     surface: wl_surface::WlSurface,
     shadow: Option<org_kde_kwin_shadow::OrgKdeKwinShadow>,
     buffers: Vec<wl_buffer::WlBuffer>,
     enabled: bool,
-    scale: u32,
 }
 
 impl KdeShadow {
@@ -91,7 +90,7 @@ impl KdeShadow {
     pub unsafe fn new(
         display: *mut std::ffi::c_void,
         surface: *mut std::ffi::c_void,
-        scale_factor: f64,
+        _scale_factor: f64,
     ) -> Option<Self> {
         let backend = unsafe { Backend::from_foreign_display(display.cast()) };
         let connection = Connection::from_backend(backend);
@@ -135,7 +134,7 @@ impl KdeShadow {
             },
         };
 
-        let geometry = ShadowGeometry::new(scale_factor);
+        let geometry = ShadowGeometry::new();
         let buffers = match create_buffers(&shm, &qh, geometry) {
             Ok(buffers) => buffers,
             Err(err) => {
@@ -151,39 +150,15 @@ impl KdeShadow {
             connection,
             event_queue,
             manager,
-            shm,
             surface,
             shadow: Some(shadow),
             buffers,
             enabled: true,
-            scale: (scale_factor * 1024.).round() as u32,
         })
     }
 
-    pub fn update(&mut self, enabled: bool, scale_factor: f64) {
-        let scale = (scale_factor * 1024.).round() as u32;
-        let geometry = ShadowGeometry::new(scale_factor);
-        if scale != self.scale {
-            let qh = self.event_queue.handle();
-            match create_buffers(&self.shm, &qh, geometry) {
-                Ok(buffers) => {
-                    self.manager.unset(&self.surface);
-                    if let Some(shadow) = self.shadow.take() {
-                        shadow.destroy();
-                    }
-                    for buffer in self.buffers.drain(..) {
-                        buffer.destroy();
-                    }
-                    self.buffers = buffers;
-                    self.scale = scale;
-                    self.enabled = false;
-                    self.surface.commit();
-                    let _ = self.connection.flush();
-                },
-                Err(err) => log::warn!("Unable to rescale KWin window shadow: {err}"),
-            }
-        }
-
+    pub fn update(&mut self, enabled: bool, _scale_factor: f64) {
+        let geometry = ShadowGeometry::new();
         if enabled == self.enabled {
             let _ = self.event_queue.dispatch_pending(&mut State);
             return;
@@ -315,18 +290,17 @@ fn shadow_pixels(
                 _ => (x - geometry.left as f32, y - radius),
             };
 
-            // Breeze removes the shadow below the window, leaving a tiny overlap to prevent
-            // fractional-scale seams between the shadow and the surface.
+            // Never leave shadow pixels underneath the window. Breeze can overlap an opaque
+            // decoration to hide fractional-scale seams, but that overlap shows through
+            // Alacritty's translucent background as a dark step around rounded corners.
             let mask_distance = signed_distance(index, x, y, radius, 0.);
-            let overlap = 2. * geometry.scale_factor;
-            let alpha = if mask_distance < -overlap {
+            let alpha = if mask_distance < 0. {
                 0.
             } else {
-                let primary_radius = PRIMARY_RADIUS * geometry.scale_factor;
-                let secondary_radius = SECONDARY_RADIUS * geometry.scale_factor;
-                let primary_offset = SHADOW_VERTICAL_OFFSET as f32 * geometry.scale_factor;
-                let secondary_offset =
-                    primary_offset + SECONDARY_RELATIVE_OFFSET_Y * geometry.scale_factor;
+                let primary_radius = PRIMARY_RADIUS;
+                let secondary_radius = SECONDARY_RADIUS;
+                let primary_offset = SHADOW_VERTICAL_OFFSET as f32;
+                let secondary_offset = primary_offset + SECONDARY_RELATIVE_OFFSET_Y;
                 let primary = PRIMARY_OPACITY
                     * gaussian_tail(
                         signed_distance(index, x, y, radius, primary_offset),
@@ -387,7 +361,7 @@ mod tests {
 
     #[test]
     fn shadow_fades_away_from_window() {
-        let geometry = ShadowGeometry::new(1.);
+        let geometry = ShadowGeometry::new();
         let pixels = shadow_pixels(2, 1, geometry.top, geometry);
         let outer_alpha = pixels[3];
         let inner_alpha = pixels[((geometry.top - 1) * 4 + 3) as usize];
@@ -396,7 +370,7 @@ mod tests {
 
     #[test]
     fn corner_is_radial() {
-        let geometry = ShadowGeometry::new(1.);
+        let geometry = ShadowGeometry::new();
         let width = geometry.left + geometry.corner_radius;
         let height = geometry.top + geometry.corner_radius;
         let pixels = shadow_pixels(1, width, height, geometry);
@@ -410,7 +384,7 @@ mod tests {
 
     #[test]
     fn corner_shadow_follows_window_rounding() {
-        let geometry = ShadowGeometry::new(1.);
+        let geometry = ShadowGeometry::new();
         let width = geometry.left + geometry.corner_radius;
         let height = geometry.top + geometry.corner_radius;
         let edge = shadow_pixels(2, 1, geometry.top, geometry);
@@ -423,9 +397,29 @@ mod tests {
     }
 
     #[test]
+    fn corner_shadow_does_not_overlap_translucent_window() {
+        let geometry = ShadowGeometry::new();
+        let width = geometry.left + geometry.corner_radius;
+        let height = geometry.top + geometry.corner_radius;
+        let corner = shadow_pixels(1, width, height, geometry);
+
+        // This pixel is just inside the rounded surface boundary. Any shadow alpha here would
+        // show through a translucent window as a dark fringe.
+        let x = geometry.left;
+        let y = geometry.top + geometry.corner_radius - 1;
+        assert_eq!(corner[((y * width + x) * 4 + 3) as usize], 0);
+    }
+
+    #[test]
     fn breeze_shadow_extends_further_below_window() {
-        let geometry = ShadowGeometry::new(1.);
+        let geometry = ShadowGeometry::new();
         assert!(geometry.bottom > geometry.top);
         assert_eq!(geometry.left, geometry.right);
+    }
+
+    #[test]
+    fn shadow_geometry_uses_logical_surface_coordinates() {
+        let geometry = ShadowGeometry::new();
+        assert_eq!(geometry.corner_radius, CORNER_RADIUS as u32);
     }
 }
