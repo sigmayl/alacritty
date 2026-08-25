@@ -33,6 +33,8 @@ use alacritty_terminal::tty;
 use crate::cli::{ParsedOptions, WindowOptions};
 use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
+#[cfg(target_os = "linux")]
+use crate::config::window::Decorations;
 use crate::display::Display;
 use crate::display::window::Window;
 use crate::event::{
@@ -286,6 +288,16 @@ impl WindowContext {
         // Always reload the theme to account for auto-theme switching.
         self.display.window.set_theme(self.config.window.theme());
 
+        #[cfg(target_os = "linux")]
+        if (old_config.window.decorations == Decorations::None)
+            != (self.config.window.decorations == Decorations::None)
+        {
+            let custom_decorations = self.config.window.decorations == Decorations::None;
+            self.display.window.set_custom_decorations(custom_decorations);
+            let dimensions = self.display.window.inner_size();
+            self.display.pending_update.set_dimensions(dimensions);
+        }
+
         // Update display if either padding options or resize increments were changed.
         let window_config = &old_config.window;
         if window_config.padding(1.) != self.config.window.padding(1.)
@@ -319,7 +331,11 @@ impl WindowContext {
         self.display.window.set_option_as_alt(self.config.window.option_as_alt());
 
         // Change opacity and blur state.
-        self.display.window.set_transparent(!opaque);
+        self.display.window.set_transparent(
+            !opaque
+                || cfg!(target_os = "linux")
+                    && self.config.window.decorations == Decorations::None,
+        );
         self.display.window.set_blur(self.config.window.blur);
 
         // Update hint keys.

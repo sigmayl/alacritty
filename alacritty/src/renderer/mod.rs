@@ -201,6 +201,20 @@ impl Renderer {
         size_info: &SizeInfo,
         glyph_cache: &mut GlyphCache,
     ) {
+        self.draw_string_with_bg_alpha(point, fg, bg, 1., string_chars, size_info, glyph_cache);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_string_with_bg_alpha(
+        &mut self,
+        point: Point<usize>,
+        fg: Rgb,
+        bg: Rgb,
+        bg_alpha: f32,
+        string_chars: impl Iterator<Item = char>,
+        size_info: &SizeInfo,
+        glyph_cache: &mut GlyphCache,
+    ) {
         let mut wide_char_spacer = false;
         let cells = string_chars.enumerate().filter_map(|(i, character)| {
             let flags = if wide_char_spacer {
@@ -219,7 +233,7 @@ impl Renderer {
                 character,
                 extra: None,
                 flags,
-                bg_alpha: 1.0,
+                bg_alpha,
                 fg,
                 bg,
                 underline: fg,
@@ -274,6 +288,38 @@ impl Renderer {
                 alpha,
             );
             gl::Clear(gl::COLOR_BUFFER_BIT);
+        }
+    }
+
+    /// Clear pixels outside rounded window corners to transparent.
+    pub fn clear_rounded_corners(&self, width: u32, height: u32, radius: u32) {
+        let radius = radius.min(width / 2).min(height / 2);
+        if radius == 0 {
+            return;
+        }
+
+        unsafe {
+            gl::Enable(gl::SCISSOR_TEST);
+            gl::ClearColor(0., 0., 0., 0.);
+
+            let radius_squared = f64::from(radius * radius);
+            for row in 0..radius {
+                let center_offset = f64::from(radius) - f64::from(row) - 0.5;
+                let inside = (radius_squared - center_offset * center_offset).sqrt();
+                let clear_width = (f64::from(radius) - inside).floor() as i32;
+                if clear_width == 0 {
+                    continue;
+                }
+
+                for y in [row as i32, height as i32 - row as i32 - 1] {
+                    gl::Scissor(0, y, clear_width, 1);
+                    gl::Clear(gl::COLOR_BUFFER_BIT);
+                    gl::Scissor(width as i32 - clear_width, y, clear_width, 1);
+                    gl::Clear(gl::COLOR_BUFFER_BIT);
+                }
+            }
+
+            gl::Disable(gl::SCISSOR_TEST);
         }
     }
 
@@ -332,9 +378,9 @@ impl Renderer {
         unsafe {
             gl::Viewport(
                 size.padding_x() as i32,
-                size.padding_y() as i32,
+                size.padding_bottom() as i32,
                 size.width() as i32 - 2 * size.padding_x() as i32,
-                size.height() as i32 - 2 * size.padding_y() as i32,
+                size.height() as i32 - size.padding_y() as i32 - size.padding_bottom() as i32,
             );
         }
     }

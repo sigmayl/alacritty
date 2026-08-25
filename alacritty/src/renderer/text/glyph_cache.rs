@@ -276,6 +276,11 @@ impl GlyphCache {
         self.load_common_glyphs(loader);
     }
 
+    /// Clear cached atlas locations without modifying the shared renderer atlas.
+    pub fn clear_cache(&mut self) {
+        self.cache = Default::default();
+    }
+
     /// Update the inner font size.
     ///
     /// NOTE: To reload the renderers's fonts [`Self::reset_glyph_cache`] should be called

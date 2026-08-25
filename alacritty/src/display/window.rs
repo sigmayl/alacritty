@@ -33,7 +33,11 @@ use winit::event_loop::ActiveEventLoop;
 use winit::monitor::MonitorHandle;
 #[cfg(windows)]
 use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
+#[cfg(all(target_os = "linux", feature = "wayland"))]
+use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+#[cfg(target_os = "linux")]
+use winit::window::ResizeDirection;
 use winit::window::{
     CursorIcon, Fullscreen, ImePurpose, Theme, UserAttentionType, Window as WinitWindow,
     WindowAttributes, WindowId,
@@ -113,6 +117,11 @@ pub struct Window {
     /// Hold the window when terminal exits.
     pub hold: bool,
 
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    kde_blur: Option<super::kde_blur::KdeBlur>,
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    kde_shadow: Option<super::kde_shadow::KdeShadow>,
+
     window: WinitWindow,
 
     /// Current window title.
@@ -122,6 +131,10 @@ pub struct Window {
     current_mouse_cursor: CursorIcon,
     mouse_visible: bool,
     ime_inhibitor: ImeInhibitor,
+
+    #[cfg(target_os = "linux")]
+    custom_decorations: bool,
+    blur_requested: bool,
 }
 
 impl Window {
@@ -178,7 +191,11 @@ impl Window {
             .with_theme(config.window.theme())
             .with_visible(false)
             .with_transparent(true)
-            .with_blur(config.window.blur)
+            .with_blur(
+                config.window.blur
+                    && !(cfg!(target_os = "linux")
+                        && config.window.decorations == Decorations::None),
+            )
             .with_maximized(config.window.maximized())
             .with_fullscreen(config.window.fullscreen())
             .with_window_level(config.window.level.into());
@@ -194,7 +211,11 @@ impl Window {
         window.set_ime_purpose(ImePurpose::Terminal);
 
         // Set initial transparency hint.
-        window.set_transparent(config.window_opacity() < 1.);
+        window.set_transparent(
+            config.window_opacity() < 1.
+                || cfg!(target_os = "linux")
+                    && config.window.decorations == Decorations::None,
+        );
 
         #[cfg(target_os = "macos")]
         use_srgb_color_space(&window);
@@ -202,6 +223,15 @@ impl Window {
         let scale_factor = window.scale_factor();
         log::info!("Window scale factor: {scale_factor}");
         let is_x11 = matches!(window.window_handle().unwrap().as_raw(), RawWindowHandle::Xlib(_));
+
+        #[cfg(target_os = "linux")]
+        let custom_decorations = config.window.decorations == Decorations::None;
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
+        let kde_blur = custom_decorations.then(|| create_kde_blur(&window)).flatten();
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
+        let kde_shadow = custom_decorations
+            .then(|| create_kde_shadow(&window, scale_factor))
+            .flatten();
 
         Ok(Self {
             hold: options.terminal_options.hold,
@@ -211,9 +241,16 @@ impl Window {
             mouse_visible: true,
             has_frame: true,
             scale_factor,
+            #[cfg(all(target_os = "linux", feature = "wayland"))]
+            kde_blur,
+            #[cfg(all(target_os = "linux", feature = "wayland"))]
+            kde_shadow,
             window,
             is_x11,
             ime_inhibitor: Default::default(),
+            #[cfg(target_os = "linux")]
+            custom_decorations,
+            blur_requested: config.window.blur,
         })
     }
 
@@ -248,6 +285,10 @@ impl Window {
     pub fn set_title(&mut self, title: String) {
         self.title = title;
         self.window.set_title(&self.title);
+        #[cfg(target_os = "linux")]
+        if self.custom_decorations {
+            self.request_redraw();
+        }
     }
 
     /// Get the window title.
@@ -372,12 +413,110 @@ impl Window {
         self.window.set_transparent(transparent);
     }
 
-    pub fn set_blur(&self, blur: bool) {
+    pub fn set_blur(&mut self, blur: bool) {
+        self.blur_requested = blur;
+        #[cfg(target_os = "linux")]
+        if self.custom_decorations {
+            self.window.set_blur(false);
+            #[cfg(feature = "wayland")]
+            if blur && self.kde_blur.is_none() {
+                self.kde_blur = create_kde_blur(&self.window);
+            }
+            self.request_redraw();
+            return;
+        }
         self.window.set_blur(blur);
     }
 
     pub fn set_maximized(&self, maximized: bool) {
         self.window.set_maximized(maximized);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub fn is_maximized(&self) -> bool {
+        self.window.is_maximized()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub fn is_fullscreen(&self) -> bool {
+        self.window.fullscreen().is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn set_custom_decorations(&mut self, enabled: bool) {
+        self.custom_decorations = enabled;
+        self.window.set_decorations(!enabled);
+        self.window.set_transparent(enabled);
+        self.window.set_blur(!enabled && self.blur_requested);
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
+        {
+            if enabled && self.kde_blur.is_none() {
+                self.kde_blur = create_kde_blur(&self.window);
+            }
+            if let Some(blur) = &mut self.kde_blur {
+                let size = self.window.inner_size();
+                blur.update(
+                    enabled && self.blur_requested,
+                    size.width,
+                    size.height,
+                    self.scale_factor,
+                    !self.window.is_maximized() && self.window.fullscreen().is_none(),
+                );
+            }
+            if enabled && self.kde_shadow.is_none() {
+                self.kde_shadow = create_kde_shadow(&self.window, self.scale_factor);
+            }
+            if let Some(shadow) = &mut self.kde_shadow {
+                shadow.update(
+                    enabled && !self.window.is_maximized() && self.window.fullscreen().is_none(),
+                    self.scale_factor,
+                );
+            }
+        }
+        self.request_redraw();
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn update_custom_decoration_effects(&mut self) {
+        #[cfg(feature = "wayland")]
+        {
+            let rounded = !self.window.is_maximized() && self.window.fullscreen().is_none();
+            if let Some(blur) = &mut self.kde_blur {
+                let size = self.window.inner_size();
+                blur.update(
+                    self.custom_decorations && self.blur_requested,
+                    size.width,
+                    size.height,
+                    self.scale_factor,
+                    rounded,
+                );
+            }
+            if let Some(shadow) = &mut self.kde_shadow {
+                shadow.update(self.custom_decorations && rounded, self.scale_factor);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub fn custom_decorations(&self) -> bool {
+        self.custom_decorations
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn drag_window(&self) {
+        if let Err(err) = self.window.drag_window() {
+            log::warn!("Unable to drag window: {err}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn drag_resize_window(&self, direction: ResizeDirection) {
+        if let Err(err) = self.window.drag_resize_window(direction) {
+            log::warn!("Unable to resize window: {err}");
+        }
     }
 
     pub fn set_minimized(&self, minimized: bool) {
@@ -510,6 +649,44 @@ impl Window {
     #[cfg(target_os = "macos")]
     pub fn tabbing_id(&self) -> String {
         self.window.tabbing_identifier()
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "wayland"))]
+fn create_kde_blur(window: &WinitWindow) -> Option<super::kde_blur::KdeBlur> {
+    let RawDisplayHandle::Wayland(display) = window.display_handle().ok()?.as_raw() else {
+        return None;
+    };
+    let RawWindowHandle::Wayland(surface) = window.window_handle().ok()?.as_raw() else {
+        return None;
+    };
+
+    // SAFETY: The blur state is dropped before its owning winit window.
+    unsafe {
+        super::kde_blur::KdeBlur::new(display.display.as_ptr(), surface.surface.as_ptr())
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "wayland"))]
+fn create_kde_shadow(
+    window: &WinitWindow,
+    scale_factor: f64,
+) -> Option<super::kde_shadow::KdeShadow> {
+    let RawDisplayHandle::Wayland(display) = window.display_handle().ok()?.as_raw() else {
+        return None;
+    };
+    let RawWindowHandle::Wayland(surface) = window.window_handle().ok()?.as_raw() else {
+        return None;
+    };
+
+    // SAFETY: The shadow is owned by `Window` and dropped before its winit window, so both raw
+    // Wayland pointers remain valid for the shadow's entire lifetime.
+    unsafe {
+        super::kde_shadow::KdeShadow::new(
+            display.display.as_ptr(),
+            surface.surface.as_ptr(),
+            scale_factor,
+        )
     }
 }
 

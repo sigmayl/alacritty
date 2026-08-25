@@ -1971,14 +1971,40 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     WindowEvent::ModifiersChanged(modifiers) => self.modifiers_input(modifiers),
                     WindowEvent::MouseInput { state, button, .. } => {
                         self.ctx.window().set_mouse_visible(true);
+
+                        #[cfg(target_os = "linux")]
+                        {
+                            let (consumed, close) =
+                                self.ctx.display.decoration_mouse_input(state, button);
+                            if close {
+                                self.ctx.window().hold = false;
+                                self.ctx.terminal.exit();
+                            }
+                            if consumed {
+                                return;
+                            }
+                        }
+
                         self.mouse_input(state, button);
                     },
                     WindowEvent::CursorMoved { position, .. } => {
                         self.ctx.window().set_mouse_visible(true);
+
+                        #[cfg(target_os = "linux")]
+                        if self.ctx.display.decoration_mouse_moved(position) {
+                            return;
+                        }
+
                         self.mouse_moved(position);
                     },
                     WindowEvent::MouseWheel { delta, phase, .. } => {
                         self.ctx.window().set_mouse_visible(true);
+
+                        #[cfg(target_os = "linux")]
+                        if self.ctx.display.decoration_has_pointer() {
+                            return;
+                        }
+
                         self.mouse_wheel_input(delta, phase);
                     },
                     WindowEvent::Touch(touch) => self.touch(touch),
@@ -2010,6 +2036,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     WindowEvent::CursorLeft { .. } => {
                         self.ctx.mouse.inside_text_area = false;
+
+                        #[cfg(target_os = "linux")]
+                        self.ctx.display.decoration_cursor_left();
 
                         if self.ctx.display().highlighted_hint.is_some() {
                             *self.ctx.dirty = true;

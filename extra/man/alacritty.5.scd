@@ -121,7 +121,11 @@ This section documents the *[window]* table of the configuration file.
 	*Full*
 		Borders and title bar.
 	*None*
-		Neither borders nor title bar.
+		On Linux, disable system decorations and use Alacritty's borderless client-side
+		title bar, rounded corners, and window controls. KWin Wayland also receives a
+		client-provided drop shadow. On other platforms, disable both borders and the
+		title bar. The Linux client-side title bar does not provide a right-click window
+		menu.
 	*Transparent* _(macOS only)_
 		Title bar, transparent background and title bar buttons.
 	*Buttonless* _(macOS only)_

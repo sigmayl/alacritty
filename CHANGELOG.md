@@ -15,6 +15,11 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 - Fixed `alacritty-escapes(7)` manpage missing from macOS install
 - Added the `Open Alacritty here` entry to the right-click context menu for folders on Windows
 
+### Changed
+
+- `window.decorations = "None"` now uses Alacritty's rounded client-side title bar and window
+  controls on Linux, with compositor shadows and rounded blur regions on KWin Wayland
+
 ### Fixed
 
 - Spurious "Failed to set new owner of XCB selection" warnings on X11

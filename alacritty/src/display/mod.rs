@@ -18,7 +18,11 @@ use glutin::surface::{Surface, SwapInterval, WindowSurface};
 use log::{debug, info};
 use parking_lot::MutexGuard;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use winit::dpi::PhysicalPosition;
 use winit::dpi::PhysicalSize;
+#[cfg(target_os = "linux")]
+use winit::event::{ElementState, MouseButton};
 use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::RawWindowHandle;
 use winit::window::CursorIcon;
@@ -60,6 +64,12 @@ use crate::string::{ShortenDirection, StrShortener};
 pub mod color;
 pub mod content;
 pub mod cursor;
+#[cfg(target_os = "linux")]
+mod decorations;
+#[cfg(all(target_os = "linux", feature = "wayland"))]
+mod kde_blur;
+#[cfg(all(target_os = "linux", feature = "wayland"))]
+mod kde_shadow;
 pub mod hint;
 pub mod window;
 
@@ -161,6 +171,12 @@ pub struct SizeInfo<T = f32> {
     /// Vertical window padding.
     padding_y: T,
 
+    /// Bottom window padding.
+    padding_bottom: T,
+
+    /// Height reserved for client side decorations.
+    titlebar_height: T,
+
     /// Number of lines in the viewport.
     screen_lines: usize,
 
@@ -177,6 +193,8 @@ impl From<SizeInfo<f32>> for SizeInfo<u32> {
             cell_height: size_info.cell_height as u32,
             padding_x: size_info.padding_x as u32,
             padding_y: size_info.padding_y as u32,
+            padding_bottom: size_info.padding_bottom as u32,
+            titlebar_height: size_info.titlebar_height as u32,
             screen_lines: size_info.screen_lines,
             columns: size_info.columns,
         }
@@ -224,6 +242,16 @@ impl<T: Clone + Copy> SizeInfo<T> {
     pub fn padding_y(&self) -> T {
         self.padding_y
     }
+
+    #[inline]
+    pub fn padding_bottom(&self) -> T {
+        self.padding_bottom
+    }
+
+    #[inline]
+    pub fn titlebar_height(&self) -> T {
+        self.titlebar_height
+    }
 }
 
 impl SizeInfo<f32> {
@@ -233,16 +261,40 @@ impl SizeInfo<f32> {
         height: f32,
         cell_width: f32,
         cell_height: f32,
+        padding_x: f32,
+        padding_y: f32,
+        dynamic_padding: bool,
+    ) -> SizeInfo {
+        Self::new_with_titlebar(
+            width,
+            height,
+            cell_width,
+            cell_height,
+            padding_x,
+            padding_y,
+            dynamic_padding,
+            0.,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_titlebar(
+        width: f32,
+        height: f32,
+        cell_width: f32,
+        cell_height: f32,
         mut padding_x: f32,
         mut padding_y: f32,
         dynamic_padding: bool,
+        titlebar_height: f32,
     ) -> SizeInfo {
+        let content_height = (height - titlebar_height).max(0.);
         if dynamic_padding {
             padding_x = Self::dynamic_padding(padding_x.floor(), width, cell_width);
-            padding_y = Self::dynamic_padding(padding_y.floor(), height, cell_height);
+            padding_y = Self::dynamic_padding(padding_y.floor(), content_height, cell_height);
         }
 
-        let lines = (height - 2. * padding_y) / cell_height;
+        let lines = (content_height - 2. * padding_y) / cell_height;
         let screen_lines = cmp::max(lines as usize, MIN_SCREEN_LINES);
 
         let columns = (width - 2. * padding_x) / cell_width;
@@ -254,7 +306,9 @@ impl SizeInfo<f32> {
             cell_width,
             cell_height,
             padding_x: padding_x.floor(),
-            padding_y: padding_y.floor(),
+            padding_y: titlebar_height + padding_y.floor(),
+            padding_bottom: padding_y.floor(),
+            titlebar_height,
             screen_lines,
             columns,
         }
@@ -396,10 +450,116 @@ pub struct Display {
     context: ManuallyDrop<PossiblyCurrentContext>,
 
     glyph_cache: GlyphCache,
+
+    #[cfg(target_os = "linux")]
+    decoration_glyph_cache: GlyphCache,
+
+    #[cfg(target_os = "linux")]
+    decorations: decorations::Decorations,
     meter: Meter,
 }
 
 impl Display {
+    #[cfg(target_os = "linux")]
+    fn decoration_layout(&self) -> decorations::Layout {
+        let size = self.window.inner_size();
+        decorations::Layout::new(
+            f64::from(size.width),
+            f64::from(size.height),
+            self.window.scale_factor,
+            !self.window.is_maximized() && !self.window.is_fullscreen(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn decoration_mouse_moved(&mut self, position: PhysicalPosition<f64>) -> bool {
+        if !self.window.custom_decorations() {
+            return false;
+        }
+
+        let hit = self.decoration_layout().hit_test(position);
+        if self.decorations.update_hover(hit) {
+            self.damage_tracker.frame().mark_fully_damaged();
+            self.window.request_redraw();
+        }
+
+        if hit == decorations::Hit::None {
+            false
+        } else {
+            self.window.set_mouse_cursor(hit.cursor_icon());
+            true
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn decoration_mouse_input(
+        &mut self,
+        state: ElementState,
+        button: MouseButton,
+    ) -> (bool, bool) {
+        use decorations::Action;
+
+        if !self.window.custom_decorations() {
+            return (false, false);
+        }
+
+        let hit = self.decorations.hovered;
+        let had_pressed_button = self.decorations.pressed.is_some();
+        let consumed = hit != decorations::Hit::None || had_pressed_button;
+        if button != MouseButton::Left {
+            return (consumed, false);
+        }
+
+        let fullscreen = self.window.is_fullscreen();
+        let action = match state {
+            ElementState::Pressed => self.decorations.press(hit, fullscreen, Instant::now()),
+            ElementState::Released => self.decorations.release(hit, fullscreen),
+        };
+
+        self.damage_tracker.frame().mark_fully_damaged();
+        self.window.request_redraw();
+
+        let close = match action {
+            Some(Action::Minimize) => {
+                self.window.set_minimized(true);
+                false
+            },
+            Some(Action::ToggleMaximized) => {
+                self.window.toggle_maximized();
+                false
+            },
+            Some(Action::ExitFullscreen) => {
+                self.window.set_fullscreen(false);
+                false
+            },
+            Some(Action::Drag) => {
+                self.window.drag_window();
+                false
+            },
+            Some(Action::Resize(direction)) => {
+                self.window.drag_resize_window(direction);
+                false
+            },
+            Some(Action::Close) => true,
+            None => false,
+        };
+
+        (consumed, close)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn decoration_has_pointer(&self) -> bool {
+        self.window.custom_decorations() && self.decorations.hovered != decorations::Hit::None
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn decoration_cursor_left(&mut self) {
+        if self.decorations.clear_pointer_state() {
+            self.damage_tracker.frame().mark_fully_damaged();
+            self.window.request_redraw();
+        }
+    }
+
     pub fn new(
         window: Window,
         gl_context: NotCurrentContext,
@@ -412,9 +572,15 @@ impl Display {
         let rasterizer = Rasterizer::new()?;
 
         let font_size = config.font.size().scale(scale_factor);
-        debug!("Loading \"{}\" font", &config.font.normal().family);
+        debug!("Loading \"{}\" font", config.font.normal().family);
         let font = config.font.clone().with_size(font_size);
         let mut glyph_cache = GlyphCache::new(rasterizer, &font)?;
+
+        #[cfg(target_os = "linux")]
+        let decoration_glyph_cache = {
+            let font = decoration_font(config, scale_factor);
+            GlyphCache::new(Rasterizer::new()?, &font)?
+        };
 
         let metrics = glyph_cache.font_metrics();
         let (cell_width, cell_height) = compute_cell_size(config, &metrics);
@@ -448,7 +614,7 @@ impl Display {
         let viewport_size = window.inner_size();
 
         // Create new size with at least one column and row.
-        let size_info = SizeInfo::new(
+        let size_info = SizeInfo::new_with_titlebar(
             viewport_size.width as f32,
             viewport_size.height as f32,
             cell_width,
@@ -456,6 +622,7 @@ impl Display {
             padding.0,
             padding.1,
             config.window.dynamic_padding && config.window.dimensions().is_none(),
+            titlebar_height(config, window.scale_factor as f32),
         );
 
         info!("Cell size: {cell_width} x {cell_height}");
@@ -525,6 +692,10 @@ impl Display {
             raw_window_handle,
             damage_tracker,
             glyph_cache,
+            #[cfg(target_os = "linux")]
+            decoration_glyph_cache,
+            #[cfg(target_os = "linux")]
+            decorations: Default::default(),
             hint_state,
             size_info,
             font_size,
@@ -639,6 +810,8 @@ impl Display {
     /// Reset glyph cache.
     fn reset_glyph_cache(&mut self) {
         let cache = &mut self.glyph_cache;
+        #[cfg(target_os = "linux")]
+        self.decoration_glyph_cache.clear_cache();
         self.renderer.with_loader(|mut api| {
             cache.reset_glyph_cache(&mut api);
         });
@@ -674,6 +847,12 @@ impl Display {
             cell_width = cell_dimensions.0;
             cell_height = cell_dimensions.1;
 
+            #[cfg(target_os = "linux")]
+            {
+                let font = decoration_font(config, self.window.scale_factor as f32);
+                let _ = self.decoration_glyph_cache.update_font_size(&font);
+            }
+
             info!("Cell size: {cell_width} x {cell_height}");
 
             // Mark entire terminal as damaged since glyph size could change without cell size
@@ -689,7 +868,7 @@ impl Display {
 
         let padding = config.window.padding(self.window.scale_factor as f32);
 
-        let mut new_size = SizeInfo::new(
+        let mut new_size = SizeInfo::new_with_titlebar(
             width,
             height,
             cell_width,
@@ -697,6 +876,7 @@ impl Display {
             padding.0,
             padding.1,
             config.window.dynamic_padding,
+            titlebar_height(config, self.window.scale_factor as f32),
         );
 
         // Update number of column/lines in the viewport.
@@ -1016,6 +1196,9 @@ impl Display {
             self.draw_hyperlink_preview(config, cursor_point, display_offset);
         }
 
+        #[cfg(target_os = "linux")]
+        self.draw_decorations(config);
+
         // Notify winit that we're about to present.
         self.window.pre_present_notify();
 
@@ -1025,6 +1208,20 @@ impl Display {
             let mut rects = Vec::with_capacity(damage.len());
             self.highlight_damage(&mut rects);
             self.renderer.draw_rects(&self.size_info, &metrics, rects);
+        }
+
+        #[cfg(target_os = "linux")]
+        if self.window.custom_decorations()
+            && !self.window.is_maximized()
+            && !self.window.is_fullscreen()
+        {
+            let radius =
+                (decorations::CORNER_RADIUS * self.window.scale_factor).round() as u32;
+            self.renderer.clear_rounded_corners(
+                self.size_info.width() as u32,
+                self.size_info.height() as u32,
+                radius,
+            );
         }
 
         // Clearing debug highlights from the previous frame requires full redraw.
@@ -1044,6 +1241,158 @@ impl Display {
         }
 
         self.damage_tracker.swap_damage();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn draw_decorations(&mut self, config: &UiConfig) {
+        use unicode_width::UnicodeWidthChar;
+
+        use decorations::{Button, Hit, Layout};
+
+        self.window.update_custom_decoration_effects();
+        if !self.window.custom_decorations() {
+            return;
+        }
+
+        let width = self.size_info.width();
+        let height = self.size_info.height();
+        let scale = self.window.scale_factor as f32;
+        let layout = Layout::new(
+            f64::from(width),
+            f64::from(height),
+            f64::from(scale),
+            !self.window.is_maximized() && !self.window.is_fullscreen(),
+        );
+        let titlebar_height = layout.titlebar_height() as f32;
+        let button_width = layout.button_width() as f32;
+        let foreground = config.colors.primary.foreground;
+        let metrics = self.decoration_glyph_cache.font_metrics();
+
+        let full_size = SizeInfo::new(width, height, 1., 1., 0., 0., false);
+        self.renderer.resize(&full_size);
+
+        let mut rects = Vec::new();
+        for button in [Button::Minimize, Button::Maximize, Button::Close] {
+            let left = layout.button_left(button) as f32;
+            let hovered = self.decorations.hovered == Hit::Button(button);
+            let pressed = self.decorations.pressed == Some(button);
+            if hovered || pressed {
+                let (color, alpha) = if button == Button::Close {
+                    (config.colors.normal.red, if pressed { 1. } else { 0.85 })
+                } else {
+                    (foreground, if pressed { 0.22 } else { 0.12 })
+                };
+                rects.push(RenderRect::new(left, 0., button_width, titlebar_height, color, alpha));
+            }
+
+            let center_x = left + button_width / 2.;
+            let center_y = titlebar_height / 2.;
+            let icon_size = (10. * scale).round().max(6.);
+            let thickness = scale.round().max(1.);
+            match button {
+                Button::Minimize => rects.push(RenderRect::new(
+                    center_x - icon_size / 2.,
+                    center_y + icon_size / 4.,
+                    icon_size,
+                    thickness,
+                    foreground,
+                    1.,
+                )),
+                Button::Maximize if self.window.is_maximized() || self.window.is_fullscreen() => {
+                    push_box(
+                        &mut rects,
+                        center_x - icon_size / 2. + 2. * thickness,
+                        center_y - icon_size / 2.,
+                        icon_size - 2. * thickness,
+                        foreground,
+                        thickness,
+                    );
+                    push_box(
+                        &mut rects,
+                        center_x - icon_size / 2.,
+                        center_y - icon_size / 2. + 2. * thickness,
+                        icon_size - 2. * thickness,
+                        foreground,
+                        thickness,
+                    );
+                },
+                Button::Maximize => push_box(
+                    &mut rects,
+                    center_x - icon_size / 2.,
+                    center_y - icon_size / 2.,
+                    icon_size,
+                    foreground,
+                    thickness,
+                ),
+                Button::Close => {
+                    let left = center_x - icon_size / 2.;
+                    let top = center_y - icon_size / 2.;
+                    let steps = icon_size.round() as usize;
+                    for step in 0..steps {
+                        let offset = step as f32;
+                        rects.push(RenderRect::new(
+                            left + offset,
+                            top + offset,
+                            thickness,
+                            thickness,
+                            foreground,
+                            1.,
+                        ));
+                        rects.push(RenderRect::new(
+                            left + icon_size - offset - thickness,
+                            top + offset,
+                            thickness,
+                            thickness,
+                            foreground,
+                            1.,
+                        ));
+                    }
+                },
+            }
+        }
+        self.renderer.draw_rects(&full_size, &metrics, rects);
+
+        let cell_width = metrics.average_advance.max(1.) as f32;
+        let cell_height = metrics.line_height.max(1.) as f32;
+        let reserved_width = 3. * button_width + 8. * scale;
+        let available_width = (width - 2. * reserved_width).max(0.);
+        let max_columns = (available_width / cell_width).floor() as usize;
+        let title = decorations::truncate_title(self.window.title(), max_columns);
+        let title_columns = title.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+        let title_width = title_columns as f32 * cell_width;
+        let title_x = ((width - title_width) / 2.).max(0.);
+        let title_y = ((titlebar_height - cell_height) / 2.).max(0.);
+        let title_size = SizeInfo {
+            width,
+            height,
+            cell_width,
+            cell_height,
+            padding_x: 0.,
+            padding_y: title_y,
+            padding_bottom: (height - title_y - cell_height).max(0.),
+            titlebar_height: 0.,
+            screen_lines: 1,
+            columns: (width / cell_width).floor() as usize,
+        };
+        self.renderer.resize(&title_size);
+        self.renderer.draw_string_with_bg_alpha(
+            Point::new(0, Column((title_x / cell_width).round() as usize)),
+            foreground,
+            config.colors.primary.background,
+            config.window_opacity(),
+            title.chars(),
+            &title_size,
+            &mut self.decoration_glyph_cache,
+        );
+
+        self.renderer.resize(&self.size_info);
+        self.damage_tracker.frame().add_viewport_rect(
+            &self.size_info,
+            0,
+            0,
+            width as i32,
+            titlebar_height as i32,
+        );
     }
 
     /// Update to a new configuration.
@@ -1628,7 +1977,59 @@ fn window_size(
     let grid_height = cell_height * dimensions.lines.max(MIN_SCREEN_LINES) as f32;
 
     let width = (padding.0).mul_add(2., grid_width).floor();
-    let height = (padding.1).mul_add(2., grid_height).floor();
+    let height =
+        (padding.1).mul_add(2., grid_height).floor() + titlebar_height(config, scale_factor);
 
     PhysicalSize::new(width as u32, height as u32)
+}
+
+#[inline]
+fn titlebar_height(config: &UiConfig, scale_factor: f32) -> f32 {
+    #[cfg(target_os = "linux")]
+    if config.window.decorations == crate::config::window::Decorations::None {
+        return decorations::TITLEBAR_HEIGHT * scale_factor;
+    }
+
+    0.
+}
+
+#[cfg(target_os = "linux")]
+fn decoration_font(config: &UiConfig, scale_factor: f32) -> Font {
+    let mut font = config.font.clone().with_size(FontSize::new(11.).scale(scale_factor));
+    font.offset = Default::default();
+    font.glyph_offset = Default::default();
+    font
+}
+
+#[cfg(target_os = "linux")]
+fn push_box(rects: &mut Vec<RenderRect>, x: f32, y: f32, size: f32, color: Rgb, thickness: f32) {
+    rects.push(RenderRect::new(x, y, size, thickness, color, 1.));
+    rects.push(RenderRect::new(x, y + size - thickness, size, thickness, color, 1.));
+    rects.push(RenderRect::new(x, y, thickness, size, color, 1.));
+    rects.push(RenderRect::new(x + size - thickness, y, thickness, size, color, 1.));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn titlebar_reserves_space_above_terminal_grid() {
+        let size = SizeInfo::new_with_titlebar(100., 230., 10., 10., 0., 0., false, 30.);
+        assert_eq!(size.screen_lines(), 20);
+        assert_eq!(size.padding_y(), 30.);
+        assert_eq!(size.padding_bottom(), 0.);
+        assert!(!size.contains_point(50, 20));
+        assert!(size.contains_point(50, 31));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn none_dimensions_include_scaled_titlebar() {
+        let mut config = UiConfig::default();
+        config.window.decorations = crate::config::window::Decorations::None;
+        let dimensions = Dimensions { columns: 10, lines: 5 };
+        let size = window_size(&config, dimensions, 10., 10., 2.);
+        assert_eq!(size.height, 110);
+    }
 }
